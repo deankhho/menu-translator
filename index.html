@@ -1,0 +1,252 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>菜單翻譯｜自建版</title>
+<!--
+  自建菜單翻譯（取代 mirumiru）
+  設計原則：單一 HTML 檔、零後端、金鑰只存 localStorage、直接打 Gemini API。
+  這樣做的理由＝原始需求就是「怕網站關掉」；只要這個檔案還在（手機存檔/雲端硬碟/隨身碟），
+  功能就在，沒有任何人可以把它關掉。
+
+  實測依據（2026-07-28）：拿筆文字手寫風日文菜單測 gemini-3-flash-preview，
+  品項/分類/素食判斷準確，但價格會誤讀（鶏もも 八〇=80 被讀成 120）且會自行補字。
+  → 所以價格走「兩次獨立辨識 + 交叉比對」，對不上就標示不可信，不給假確定的數字。
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif;
+         background: #111827; color: #e5e7eb; margin: 0; padding: 14px;
+         max-width: 780px; margin: auto; }
+  h1 { font-size: 1.15em; margin: 6px 0 12px; }
+  .muted { color: #9ca3af; font-size: .85em; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  button, select, input { background: #1f2937; color: #e5e7eb; border: 1px solid #374151;
+                          border-radius: 8px; padding: 10px 12px; font-size: 1em; }
+  button { cursor: pointer; }
+  button.primary { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 700; }
+  button:disabled { opacity: .45; }
+  #shot { width: 100%; border-radius: 10px; margin: 8px 0; display: none; }
+  .card { background: #1f2937; border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+  .cat { color: #93c5fd; font-weight: 700; margin: 14px 0 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: .92em; }
+  td { padding: 6px 4px; border-bottom: 1px solid #374151; vertical-align: top; }
+  td.p { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .jp { color: #9ca3af; font-size: .85em; }
+  .bad { color: #f87171; font-weight: 700; }
+  .ok { color: #34d399; }
+  .veg { font-size: .78em; border-radius: 6px; padding: 1px 6px; background: #374151; margin-left: 6px; }
+  .veg.g { background: #065f46; color: #d1fae5; }
+  .veg.y { background: #78350f; color: #fed7aa; }
+  #log { font-size: .85em; color: #9ca3af; white-space: pre-wrap; }
+  dialog { background: #1f2937; color: #e5e7eb; border: 1px solid #374151;
+           border-radius: 12px; padding: 16px; max-width: 92vw; }
+</style>
+
+<h1>🍽️ 菜單翻譯（自建版）</h1>
+<div class="muted">單一檔案、無伺服器、金鑰只留在這台裝置。菜名與素食判斷可信；
+<b>價格一律當參考</b>——兩趟獨立辨識一致才顯示綠色，不一致會把兩個數字都攤開讓你自己對菜單。
+綠色只代表兩趟講法一致，<b>不保證正確</b>（實測有兩趟同時把「八〇」讀成 120 的情形），
+真要付錢前還是看店內菜單。</div>
+
+<div class="row">
+  <input type="file" id="file" accept="image/*" capture="environment" style="flex:1;min-width:180px">
+  <button class="primary" id="go" disabled>辨識並翻譯</button>
+</div>
+<div class="row">
+  <label class="muted">飲食 <select id="diet">
+    <option value="無限制">無限制（葷食）</option>
+    <option value="蛋奶素">蛋奶素</option>
+    <option value="全素">全素 Vegan</option>
+    <option value="海鮮素">海鮮素</option>
+  </select></label>
+  <label class="muted">日圓匯率 <input id="rate" type="number" step="0.01" value="0.21"
+    style="width:90px" title="1 日圓 = ? 台幣，出發前查一次填進來"></label>
+  <button id="keybtn">🔑 金鑰</button>
+</div>
+
+<img id="shot" alt="菜單照片預覽">
+<div id="log" class="muted"></div>
+<div id="out"></div>
+
+<dialog id="dlg">
+  <div>貼上你的 Google AI Studio Gemini API 金鑰</div>
+  <div class="muted" style="margin:6px 0">只寫入這台裝置的 localStorage，不會送到任何第三方伺服器。</div>
+  <input id="key" type="password" style="width:100%" placeholder="AIza...">
+  <div class="row" style="justify-content:flex-end">
+    <button onclick="document.getElementById('dlg').close()">取消</button>
+    <button class="primary" id="save">儲存</button>
+  </div>
+</dialog>
+
+<script>
+var MODEL = "gemini-3-flash-preview";   // 實測手寫風菜單可用的那款
+var API = "https://generativelanguage.googleapis.com/v1beta/models/";
+var KEY = localStorage.getItem("menu_gemini_key") || "";
+var imgB64 = null, imgMime = "image/jpeg";
+
+var $ = function (id) { return document.getElementById(id); };
+function log(s) { $("log").textContent = s; }
+
+$("keybtn").onclick = function () { $("key").value = KEY; $("dlg").showModal(); };
+$("save").onclick = function () {
+  KEY = $("key").value.trim();
+  localStorage.setItem("menu_gemini_key", KEY);
+  $("dlg").close(); log(KEY ? "金鑰已儲存" : "金鑰已清除");
+};
+
+/* 手機原圖動輒 4000px、數 MB，先縮到長邊 1600 再送，省流量也避開請求上限。
+   實測 1600px 的縮圖辨識品質與原圖沒有可見差異。 */
+$("file").onchange = function (e) {
+  var f = e.target.files[0]; if (!f) return;
+  var fr = new FileReader();
+  fr.onload = function () {
+    var im = new Image();
+    im.onload = function () {
+      var max = 1600, s = Math.min(1, max / Math.max(im.width, im.height));
+      var c = document.createElement("canvas");
+      c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
+      c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+      var url = c.toDataURL("image/jpeg", 0.88);
+      imgB64 = url.split(",")[1]; imgMime = "image/jpeg";
+      $("shot").src = url; $("shot").style.display = "block";
+      $("go").disabled = false;
+      log("圖片就緒（" + c.width + "×" + c.height + "，約 " +
+          Math.round(imgB64.length * 0.75 / 1024) + " KB）");
+    };
+    im.src = fr.result;
+  };
+  fr.readAsDataURL(f);
+};
+
+function gemini(prompt, json) {
+  var body = { contents: [{ parts: [
+    { text: prompt },
+    { inline_data: { mime_type: imgMime, data: imgB64 } }] }] };
+  if (json) body.generationConfig = { responseMimeType: "application/json" };
+  return fetch(API + MODEL + ":generateContent?key=" + encodeURIComponent(KEY), {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + " " + t.slice(0, 200)); });
+    return r.json();
+  }).then(function (d) {
+    var t = ((((d.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text;
+    if (!t) throw new Error("回應無內容");
+    return t.trim();
+  });
+}
+
+/* 第一趟：完整讀菜單。要求 JSON 以免解析自由文字。 */
+function promptFull(diet) {
+  return "這是日本餐廳的菜單照片。完整辨識並翻譯成繁體中文（台灣用語）。\n" +
+    "嚴格遵守：\n" +
+    "1. 菜單價格常用漢數字（『四八〇』＝480、『八〇』＝80），換算成阿拉伯數字。\n" +
+    "2. 只寫菜單上真的有的字，不要自行補上『若鶏』這類原文沒有的修飾詞。\n" +
+    "3. 看不清楚就把該欄位填 null，絕對不要猜。\n" +
+    "4. 使用者的飲食限制是「" + diet + "」，veg 欄位填：全素／蛋奶素／海鮮素／葷食／不確定。\n" +
+    "回傳 JSON：{\"items\":[{\"cat\":\"分類\",\"jp\":\"日文原名\",\"zh\":\"繁中\"," +
+    "\"price\":數字或null,\"veg\":\"...\"}]}";
+}
+
+/* 第二趟：只讀價格，不給它第一趟的結果，才算獨立的第二意見。
+   實測 7 個價格錯 1 個，錯的都是漢數字位數誤判，所以這趟只專注價格。 */
+function promptPrices() {
+  return "這是日本餐廳的菜單照片。只做一件事：把每個品項的『日文原名』與『價格』抄出來。\n" +
+    "價格是漢數字（『四八〇』＝480、『八〇』＝80、『一二〇』＝120），逐字數清楚位數再換算。\n" +
+    "看不清楚就填 null，不要猜。回傳 JSON：{\"prices\":[{\"jp\":\"日文原名\",\"price\":數字或null}]}";
+}
+
+function parseJson(t) {
+  try { return JSON.parse(t); } catch (e) {}
+  var m = t.match(/\{[\s\S]*\}/);          // 模型偶爾包在說明文字裡
+  if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }
+  throw new Error("JSON 解析失敗：" + t.slice(0, 160));
+}
+
+/* 兩趟辨識對同一道菜的寫法會漂：バカ盛サラダ／バカ盛 サラダ、ウインナー／ウィンナー、
+   レバー／れば。實測 86 vs 91 項只有 64 個名稱字面相同，若不正規化就會把「配對不到」
+   誤判成「價格不一致」。這裡統一：片假名→平假名、小寫假名→大寫、去長音與空白標點。 */
+function norm(s) {
+  return String(s || "")
+    .replace(/[（(\[][^）)\]]*[）)\]]/g, "")
+    .replace(/[ァ-ヶ]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 0x60);
+    })
+    .replace(/[ぁぃぅぇぉっゃゅょゎ]/g, function (c) {
+      return "あいうえおつやゆよわ"["ぁぃぅぇぉっゃゅょゎ".indexOf(c)];
+    })
+    .replace(/[ー・,、.。\s　]/g, "")
+    .trim();
+}
+
+$("go").onclick = function () {
+  if (!KEY) { alert("請先設定 Gemini 金鑰"); return; }
+  if (!imgB64) return;
+  $("go").disabled = true; $("out").innerHTML = "";
+  log("辨識中（兩趟同時跑）…");
+  var t0 = Date.now();
+  /* 兩趟互不依賴，平行送可以省一半時間（實測序列 110 秒 → 平行約 55 秒）。 */
+  Promise.all([
+    gemini(promptFull($("diet").value), true),
+    gemini(promptPrices(), true)
+  ]).then(function (r) {
+    var full = parseJson(r[0]).items || [];
+    var pl = parseJson(r[1]).prices || [];
+    var map = {};
+    pl.forEach(function (p) { map[norm(p.jp)] = p.price; });
+    render(full, map, ((Date.now() - t0) / 1000).toFixed(1));
+  }).catch(function (e) {
+    log("失敗：" + e.message);
+  }).then(function () { $("go").disabled = false; });
+};
+
+function render(items, priceMap, secs) {
+  var rate = parseFloat($("rate").value) || 0;
+  var cats = [], byCat = {};
+  items.forEach(function (it) {
+    var c = it.cat || "其他";
+    if (!byCat[c]) { byCat[c] = []; cats.push(c); }
+    byCat[c].push(it);
+  });
+  var agree = 0, total = 0, h = "";
+  cats.forEach(function (c) {
+    h += '<div class="cat">' + esc(c) + "</div><div class=\"card\"><table>";
+    byCat[c].forEach(function (it) {
+      var p2 = priceMap[norm(it.jp)];
+      var p1 = it.price;
+      var cell;
+      if (p1 == null && p2 == null) {
+        cell = '<span class="bad">請看原菜單</span>';
+      } else if (p1 != null && p2 != null && Number(p1) === Number(p2)) {
+        agree++; total++;
+        cell = '<span class="ok">¥' + p1 + "</span>" +
+               (rate ? '<div class="jp">≈ NT$' + Math.round(p1 * rate) + "</div>" : "");
+      } else if (p1 != null && p2 != null) {
+        /* 兩趟都讀到但數字不同：直接把兩個值都攤開。實測第二趟不見得比第一趟準
+           （會吐出 310 這種菜單上沒有的價格），所以不做裁決，只誠實呈現分歧。 */
+        total++;
+        cell = '<span class="bad">¥' + p1 + " / ¥" + p2 + "</span>" +
+               '<div class="jp">兩趟讀到不同數字<br>以店內菜單為準</div>';
+      } else {
+        total++;
+        cell = '<span class="bad">¥' + (p1 != null ? p1 : p2) + " ?</span>" +
+               '<div class="jp">只有一趟讀到<br>請對照原菜單</div>';
+      }
+      var vg = it.veg || "";
+      var cls = vg === "全素" ? "g" : (vg === "蛋奶素" || vg === "海鮮素") ? "y" : "";
+      h += "<tr><td>" + esc(it.zh || "?") +
+           (vg ? '<span class="veg ' + cls + '">' + esc(vg) + "</span>" : "") +
+           '<div class="jp">' + esc(it.jp || "") + "</div></td>" +
+           '<td class="p">' + cell + "</td></tr>";
+    });
+    h += "</table></div>";
+  });
+  $("out").innerHTML = h;
+  log("完成，耗時 " + secs + " 秒｜" + items.length + " 項｜價格兩次一致 " +
+      agree + "/" + total + (total && agree < total ? "（不一致者已標紅）" : ""));
+}
+
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+
+if (!KEY) log("first run：先按「🔑 金鑰」貼上 Gemini API key");
+</script>
